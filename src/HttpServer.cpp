@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <cctype>
 #include <random>
+#include <unordered_map>
 
 HttpServer::HttpServer(int port) : port_(port), listen_socket_(INVALID_SOCKET), con_(nullptr) {}
 
@@ -285,11 +286,82 @@ std::string HttpServer::handleRequest(const std::string& method, const std::stri
     if (method == "GET" && route == "/") {
         std::string roleName = isAdmin() ? "管理员" : "用户";
         std::string loginUser = session ? session->user_id : "";
-        std::string b = "<div class='card'><div class='card-body'>"
+        auto categoryCn = [](const std::string& value) {
+            static const std::unordered_map<std::string, std::string> catMap = {
+                {"life", "生活"}, {"study", "学习"}, {"sport", "运动"}, {"digital", "数码"}, {"other", "其他"}};
+            auto it = catMap.find(value);
+            return it == catMap.end() ? value : it->second;
+        };
+
+        int totalItems = 0;
+        if (mysql_query(con_, "SELECT COUNT(*) FROM item") == 0) {
+            MYSQL_RES* r = mysql_store_result(con_);
+            MYSQL_ROW row = r ? mysql_fetch_row(r) : nullptr;
+            if (row && row[0]) totalItems = atoi(row[0]);
+            if (r) mysql_free_result(r);
+        }
+
+        double avgPrice = 0.0;
+        if (mysql_query(con_, "SELECT AVG(price) FROM item") == 0) {
+            MYSQL_RES* r = mysql_store_result(con_);
+            MYSQL_ROW row = r ? mysql_fetch_row(r) : nullptr;
+            if (row && row[0] && row[0][0]) {
+                try {
+                    avgPrice = std::stod(row[0]);
+                } catch (...) {}
+            }
+            if (r) mysql_free_result(r);
+        }
+
+        std::ostringstream stats;
+        stats << "<div class='card mb-3'><div class='card-body'>"
+              << "<h5 class='card-title'>数据统计（聚合与分组）</h5>"
+              << "<p class='mb-2'><strong>商品总数：</strong>" << totalItems << "</p>"
+              << "<p class='mb-2'><strong>所有商品平均价格：</strong>"
+              << std::fixed << std::setprecision(2) << avgPrice << " 元</p>"
+              << "<h6 class='mt-3'>每类商品数量</h6>"
+              << "<div class='table-responsive'><table class='table table-sm table-bordered align-middle'>"
+              << "<thead><tr><th>类别</th><th>数量</th><th>操作</th></tr></thead><tbody>";
+        if (mysql_query(con_, "SELECT category, COUNT(*) AS cnt FROM item GROUP BY category ORDER BY category") == 0) {
+            MYSQL_RES* r = mysql_store_result(con_);
+            MYSQL_ROW row;
+            bool anyCat = false;
+            while (r && (row = mysql_fetch_row(r))) {
+                anyCat = true;
+                std::string cat = row[0] ? row[0] : "";
+                std::string cnt = row[1] ? row[1] : "0";
+                stats << "<tr><td>" << htmlEscape(categoryCn(cat)) << " <code class='text-muted'>" << htmlEscape(cat) << "</code></td>"
+                      << "<td>" << htmlEscape(cnt) << "</td>"
+                      << "<td><a class='btn btn-sm btn-success' href='/queries?category=" << urlEncode(cat) << "&status=0'>去购买</a></td></tr>";
+            }
+            if (r) mysql_free_result(r);
+            if (!anyCat) stats << "<tr><td colspan='3' class='text-secondary'>暂无商品。</td></tr>";
+        }
+        stats << "</tbody></table></div>";
+
+        stats << "<h6 class='mt-3'>发布商品数量最多的用户</h6>";
+        if (mysql_query(con_, "SELECT seller_id, COUNT(*) AS c FROM item GROUP BY seller_id HAVING c = (SELECT MAX(c2) FROM (SELECT COUNT(*) AS c2 FROM item GROUP BY seller_id) q)") == 0) {
+            MYSQL_RES* r = mysql_store_result(con_);
+            MYSQL_ROW row;
+            bool anySeller = false;
+            while (r && (row = mysql_fetch_row(r))) {
+                anySeller = true;
+                std::string sid = row[0] ? row[0] : "";
+                std::string c = row[1] ? row[1] : "";
+                stats << "<p class='mb-2 d-flex flex-wrap align-items-center gap-2'>"
+                      << "<span><strong>" << htmlEscape(sid) << "</strong>，共发布 " << htmlEscape(c) << " 件</span>"
+                      << "<a class='btn btn-sm btn-outline-primary' href='/queries?seller_id=" << urlEncode(sid) << "'>去看看</a></p>";
+            }
+            if (r) mysql_free_result(r);
+            if (!anySeller) stats << "<p class='text-secondary mb-0'>暂无商品数据。</p>";
+        }
+        stats << "</div></div>";
+
+        std::string b = "<div class='card mb-3'><div class='card-body'>"
                         "<p class='mb-2'>校园二手交易数据库系统（C++ 版本）。</p>"
                         "<p class='mb-2'>当前登录角色：" + roleName + "，账号：" + htmlEscape(loginUser) + "</p>"
                         "<a class='btn btn-outline-secondary btn-sm' href='/logout'>退出登录</a>"
-                        "</div></div>";
+                        "</div></div>" + stats.str();
         std::string html = htmlPage("首页", b);
         std::ostringstream res;
         res << "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " << html.size() << "\r\nConnection: close\r\n\r\n" << html;
@@ -348,23 +420,74 @@ std::string HttpServer::handleRequest(const std::string& method, const std::stri
     if (method == "POST" && route == "/buy") {
         if (!isUser()) return forbidden();
         auto f = parseForm(body);
+        std::string itemIdRaw = f.count("item_id") ? f["item_id"] : "";
+        std::string itemEsc = sqlEscape(itemIdRaw);
+        std::string returnQ = f.count("return_q") ? f["return_q"] : "";
+
+        auto buyRedirect = [&](const std::string& key, const std::string& val) {
+            std::string suf = key + "=" + urlEncode(val);
+            if (!returnQ.empty()) return redirect("/queries?" + returnQ + "&" + suf);
+            return redirect("/orders?" + suf);
+        };
+
+        std::string orderIdRaw = f.count("order_id") ? f["order_id"] : "";
+        while (!orderIdRaw.empty() && (orderIdRaw.front() == ' ' || orderIdRaw.front() == '\t')) orderIdRaw.erase(0, 1);
+        while (!orderIdRaw.empty() && (orderIdRaw.back() == ' ' || orderIdRaw.back() == '\t')) orderIdRaw.pop_back();
+
+        if (orderIdRaw.empty()) {
+            for (int attempt = 0; attempt < 30; ++attempt) {
+                std::string sid = makeSessionId();
+                orderIdRaw = "o" + sid.substr(0, 8);
+                bool exists = false;
+                std::ostringstream ck;
+                ck << "SELECT COUNT(*) FROM orders WHERE order_id='" << sqlEscape(orderIdRaw) << "'";
+                if (mysql_query(con_, ck.str().c_str()) == 0) {
+                    MYSQL_RES* r = mysql_store_result(con_);
+                    MYSQL_ROW row = r ? mysql_fetch_row(r) : nullptr;
+                    exists = row && row[0] && atoi(row[0]) > 0;
+                    if (r) mysql_free_result(r);
+                }
+                if (!exists) break;
+                orderIdRaw.clear();
+            }
+        }
+
+        if (itemIdRaw.empty() || orderIdRaw.empty()) return buyRedirect("buy_err", "badreq");
+
+        std::string orderEsc = sqlEscape(orderIdRaw);
         mysql_query(con_, "START TRANSACTION");
         std::ostringstream s1;
-        s1 << "SELECT status FROM item WHERE item_id='" << f["item_id"] << "' FOR UPDATE";
-        if (mysql_query(con_, s1.str().c_str()) == 0) {
+        s1 << "SELECT status FROM item WHERE item_id='" << itemEsc << "' FOR UPDATE";
+        std::string buyErr;
+        if (mysql_query(con_, s1.str().c_str()) != 0) {
+            mysql_query(con_, "ROLLBACK");
+            buyErr = "fail";
+        } else {
             MYSQL_RES* res = mysql_store_result(con_);
             MYSQL_ROW row = res ? mysql_fetch_row(res) : nullptr;
-            bool ok = row && atoi(row[0]) == 0;
+            bool rowExists = row != nullptr;
+            bool ok = rowExists && row[0] && atoi(row[0]) == 0;
             if (res) mysql_free_result(res);
-            if (ok) {
+            if (!rowExists) {
+                mysql_query(con_, "ROLLBACK");
+                buyErr = "notfound";
+            } else if (!ok) {
+                mysql_query(con_, "ROLLBACK");
+                buyErr = "sold";
+            } else {
                 std::ostringstream s2, s3;
-                s2 << "INSERT INTO orders(order_id,item_id,buyer_id,order_date) VALUES('" << f["order_id"] << "','" << f["item_id"] << "','" << sqlEscape(session->user_id) << "',NOW())";
-                s3 << "UPDATE item SET status=1 WHERE item_id='" << f["item_id"] << "'";
-                if (mysql_query(con_, s2.str().c_str()) == 0 && mysql_query(con_, s3.str().c_str()) == 0) mysql_query(con_, "COMMIT");
-                else mysql_query(con_, "ROLLBACK");
-            } else mysql_query(con_, "ROLLBACK");
-        } else mysql_query(con_, "ROLLBACK");
-        return redirect("/orders");
+                s2 << "INSERT INTO orders(order_id,item_id,buyer_id,order_date) VALUES('" << orderEsc << "','" << itemEsc << "','"
+                   << sqlEscape(session->user_id) << "',NOW())";
+                s3 << "UPDATE item SET status=1 WHERE item_id='" << itemEsc << "'";
+                if (mysql_query(con_, s2.str().c_str()) == 0 && mysql_query(con_, s3.str().c_str()) == 0) {
+                    mysql_query(con_, "COMMIT");
+                    return buyRedirect("buy_ok", "1");
+                }
+                mysql_query(con_, "ROLLBACK");
+                buyErr = "fail";
+            }
+        }
+        return buyRedirect("buy_err", buyErr);
     }
 
     auto makeTablePage = [&](const std::string& title, const std::string& sql, const std::string& extraForms) {
@@ -405,11 +528,28 @@ std::string HttpServer::handleRequest(const std::string& method, const std::stri
     if (method == "GET" && route == "/item") return handleItemGet(query, session);
 
     if (method == "GET" && route == "/orders") {
+        std::string orderFlash;
+        if (query.count("buy_ok") && query["buy_ok"] == "1")
+            orderFlash = "<div class='alert alert-success'>下单成功，订单已写入数据库。</div>";
+        if (query.count("buy_err")) {
+            std::string e = query["buy_err"];
+            if (e == "sold")
+                orderFlash = "<div class='alert alert-warning'>该商品已售出，无法再次购买。</div>";
+            else if (e == "notfound")
+                orderFlash = "<div class='alert alert-warning'>未找到该商品。</div>";
+            else if (e == "badreq")
+                orderFlash = "<div class='alert alert-danger'>请求无效。</div>";
+            else
+                orderFlash = "<div class='alert alert-danger'>下单失败，请重试或前往「查询」页操作。</div>";
+        }
         std::string forms =
+            orderFlash +
             "<div class='card mb-3'><div class='card-body'>"
-            "<h5>购买商品</h5><form class='row g-2' method='post' action='/buy'>"
-            "<div class='col-md-3'><input class='form-control' name='order_id' placeholder='order_id'></div>"
-            "<div class='col-md-3'><input class='form-control' name='item_id' placeholder='item_id'></div>"
+            "<h5>购买商品（备用）</h5>"
+            "<p class='text-secondary small mb-2'>推荐在「查询」页对未售商品直接点「下单」；订单号可留空由系统自动生成。</p>"
+            "<form class='row g-2' method='post' action='/buy'>"
+            "<div class='col-md-3'><input class='form-control' name='order_id' placeholder='order_id（可空）'></div>"
+            "<div class='col-md-3'><input class='form-control' name='item_id' placeholder='item_id' required></div>"
             "<div class='col-md-3'><button class='btn btn-success w-100'>购买</button></div>"
             "</form></div></div>";
         if (isAdmin()) {
@@ -447,6 +587,21 @@ std::string HttpServer::handleRequest(const std::string& method, const std::stri
         std::string status = query.count("status") ? query["status"] : "";
         std::string sellerId = query.count("seller_id") ? query["seller_id"] : "";
         std::string keyword = query.count("keyword") ? query["keyword"] : "";
+
+        std::string buyFlash;
+        if (query.count("buy_ok") && query["buy_ok"] == "1")
+            buyFlash += "<div class='alert alert-success'>下单成功，订单已写入数据库，商品状态已更新为已售出。</div>";
+        if (query.count("buy_err")) {
+            std::string e = query["buy_err"];
+            if (e == "sold")
+                buyFlash += "<div class='alert alert-warning'><strong>无法购买：</strong>该商品已售出。</div>";
+            else if (e == "notfound")
+                buyFlash += "<div class='alert alert-warning'>未找到该商品，可能已被删除。</div>";
+            else if (e == "badreq")
+                buyFlash += "<div class='alert alert-danger'>请求无效。</div>";
+            else
+                buyFlash += "<div class='alert alert-danger'>下单失败，请稍后重试。</div>";
+        }
 
         std::vector<std::string> conditions;
         double minPriceNum = 0.0, maxPriceNum = 0.0;
@@ -498,6 +653,11 @@ std::string HttpServer::handleRequest(const std::string& method, const std::stri
         if (page > totalPages) page = totalPages;
         int offset = (page - 1) * pageSize;
 
+        std::ostringstream rq;
+        rq << "page=" << page << "&min_price=" << minPrice << "&max_price=" << maxPrice << "&category=" << category << "&status=" << status << "&seller_id=" << sellerId
+           << "&keyword=" << keyword;
+        std::string returnQStr = rq.str();
+
         std::ostringstream listSql;
         listSql << "SELECT * FROM item" << whereSql << " ORDER BY " << sortField << " DESC LIMIT " << pageSize << " OFFSET " << offset;
         MYSQL_RES* res = nullptr;
@@ -525,7 +685,7 @@ std::string HttpServer::handleRequest(const std::string& method, const std::stri
         };
 
         std::ostringstream b;
-        b << "<div class='card mb-3'><div class='card-body'>"
+        b << buyFlash << "<div class='card mb-3'><div class='card-body'>"
           << "<form class='row g-2' method='get' action='/queries'>"
           << "<div class='col-md-12'>"
           << "<button class='btn btn-outline-primary' type='button' data-bs-toggle='collapse' data-bs-target='#filterPanel'>过滤条件</button>"
@@ -560,11 +720,19 @@ std::string HttpServer::handleRequest(const std::string& method, const std::stri
         if (res) {
             MYSQL_FIELD* fields = mysql_fetch_fields(res);
             unsigned int n = mysql_num_fields(res);
+            int statusIdx = -1, itemIdIdx = -1;
+            for (unsigned int i = 0; i < n; ++i) {
+                std::string fname = fields[i].name ? fields[i].name : "";
+                if (fname == "status") statusIdx = static_cast<int>(i);
+                if (fname == "item_id") itemIdIdx = static_cast<int>(i);
+            }
             b << "<tr>";
             for (unsigned int i = 0; i < n; ++i) b << "<th>" << fieldDisplayName(fields[i].name) << "</th>";
-            b << "</tr>";
+            b << "<th>操作</th></tr>";
             MYSQL_ROW row;
             while ((row = mysql_fetch_row(res))) {
+                std::string st = (statusIdx >= 0 && row[statusIdx]) ? row[statusIdx] : "";
+                std::string iid = (itemIdIdx >= 0 && row[itemIdIdx]) ? row[itemIdIdx] : "";
                 b << "<tr>";
                 for (unsigned int i = 0; i < n; ++i) {
                     std::string raw = row[i] ? row[i] : "";
@@ -574,7 +742,22 @@ std::string HttpServer::handleRequest(const std::string& method, const std::stri
                     }
                     b << "<td>" << cell << "</td>";
                 }
-                b << "</tr>";
+                b << "<td>";
+                if (isUser()) {
+                    if (st == "0") {
+                        b << "<form method='post' action='/buy' class='d-inline' onsubmit=\"return confirm('确认购买该商品？');\">"
+                          << "<input type='hidden' name='item_id' value='" << htmlEscape(iid) << "'>"
+                          << "<input type='hidden' name='return_q' value='" << htmlEscape(returnQStr) << "'>"
+                          << "<button type='submit' class='btn btn-sm btn-success'>下单</button></form>";
+                    } else {
+                        b << "<button type='button' class='btn btn-sm btn-outline-secondary' onclick=\"alert('该商品已售出，无法再次购买。');\">下单</button>";
+                    }
+                } else if (isAdmin()) {
+                    b << "<span class='text-muted'>—</span>";
+                } else {
+                    b << "—";
+                }
+                b << "</td></tr>";
             }
             mysql_free_result(res);
         }
