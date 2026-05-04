@@ -1,0 +1,4 @@
+*.pdf
+.vs/
+*.keep
+build/
